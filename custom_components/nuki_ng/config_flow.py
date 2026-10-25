@@ -63,6 +63,29 @@ class NukiNGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.exception(f"Error getting HASS url: {err}")
             return ""
 
+    def _schema(self, user_input: dict):
+        return vol.Schema({
+            vol.Optional("address", default=user_input.get("address", "")): cv.string,
+            vol.Optional("hass_url", default=user_input.get("hass_url", "")): cv.string,
+            vol.Optional("token", default=user_input.get("token", "")): cv.string,
+            vol.Optional("web_token", default=user_input.get("web_token", "")): cv.string,
+            vol.Optional("name", default=user_input.get("name", "")): cv.string,
+            vol.Required("update_seconds", default=user_input.get("update_seconds", 30)): vol.All(
+                cv.positive_int,
+                vol.Range(min=10, max=600)
+            ),
+        })
+
+    async def _validate(self, user_input: dict):
+        if not user_input.get("token") and not user_input.get("web_token"):
+            return "no_token", None
+        if user_input.get("token") and not user_input.get("address"):
+            return "no_bridge_url", None
+        title, err, use_hashed_token = await self.find_nuki_devices(user_input)
+        if err:
+            return err, None
+        return None, {**user_input, "use_hashed": use_hashed_token, "name": user_input.get("name") or title}
+
     async def async_step_user(self, user_input):
         errors = None
         _LOGGER.debug(f"Input: {user_input}")
@@ -74,34 +97,27 @@ class NukiNGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "address": bridge_address,
                 "hass_url": hass_url
             }
-        elif not user_input.get("token") and not user_input.get("web_token"):
-            errors = dict(base="no_token")
-        elif user_input.get("token") and not user_input.get("address"):
-            errors = dict(base="no_bridge_url")
-        elif user_input.get("token") or user_input.get("web_token"):
-            title, err, use_hashed_token = await self.find_nuki_devices(user_input)
+        else:
+            err, data = await self._validate(user_input)
             if not err:
-                return self.async_create_entry(
-                    title=user_input.get("name") or title,
-                    data={
-                        **user_input,
-                        "use_hashed": use_hashed_token,
-                    }
-                )
+                return self.async_create_entry(title=data["name"], data=data)
             errors = dict(base=err)
-        schema = vol.Schema({
-            vol.Optional("address", default=user_input.get("address", "")): cv.string,
-            vol.Optional("hass_url", default=user_input.get("hass_url", "")): cv.string,
-            vol.Optional("token", default=user_input.get("token", "")): cv.string,
-            vol.Optional("web_token", default=user_input.get("web_token", "")): cv.string,
-            vol.Optional("name", default=user_input.get("name", "")): cv.string,
-            vol.Required("update_seconds", default=user_input.get("update_seconds", 30)): vol.All(
-                cv.positive_int,
-                vol.Range(min=10, max=600)
-            ),
-        })
         return self.async_show_form(
-            step_id="user", data_schema=schema, errors=errors
+            step_id="user", data_schema=self._schema(user_input), errors=errors
+        )
+
+    async def async_step_reconfigure(self, user_input=None):
+        entry = self._get_reconfigure_entry()
+        errors = None
+        if user_input is None:
+            user_input = dict(entry.data)
+        else:
+            err, data = await self._validate(user_input)
+            if not err:
+                return self.async_update_reload_and_abort(entry, data_updates=data)
+            errors = dict(base=err)
+        return self.async_show_form(
+            step_id="reconfigure", data_schema=self._schema(user_input), errors=errors
         )
 
     # def async_get_options_flow(config_entry):
