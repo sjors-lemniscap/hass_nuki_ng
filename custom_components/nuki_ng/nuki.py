@@ -5,7 +5,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
-from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.network import get_url
 from homeassistant.components import webhook
 from homeassistant.exceptions import HomeAssistantError
@@ -24,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 BRIDGE_DISCOVERY_API = "https://api.nuki.io/discover/bridges"
 BRIDGE_HOOK = "nuki_ng_bridge_hook"
 BRIDGE_TIMEOUT = 10
+CALLBACK_CHECK_INTERVAL = timedelta(minutes=10)
 
 LOCK_DEVICE_TYPES = (0, 3, 4, 5)
 OPENER_DEVICE_TYPES = (2,)
@@ -137,51 +138,47 @@ class NukiInterface:
             )
         )
 
-    async def bridge_remove_callback(self, callback: str):
-        callbacks = await self.async_json(
-            lambda r: r.get(self.bridge_url("/callback/list"), timeout=BRIDGE_TIMEOUT)
-        )
-        _LOGGER.debug(f"bridge_remove_callback: {callbacks}, {callback}")
-        callbacks_list = callbacks.get("callbacks", [])
-        for item in callbacks_list:
-            if item["url"] == callback:
-                result = await self.async_json(
-                    lambda r: r.get(
-                        self.bridge_url("/callback/remove", {"id": item["id"]}),
-                        timeout=BRIDGE_TIMEOUT
-                    )
-                )
-                if not result.get("success", True):
-                    raise HomeAssistantError(result.get("message"))
-                return True
-        return False
-
-    async def bridge_check_callback(self, callback: str):
-        callbacks = await self.async_json(
-            lambda r: r.get(self.bridge_url("/callback/list"), timeout=BRIDGE_TIMEOUT)
-        )
-        _LOGGER.debug(f"bridge_check_callback: {callbacks}, {callback}")
-        result = dict()
-        callbacks_list = callbacks.get("callbacks", [])
-        if len(callbacks_list) and callbacks_list[0]["url"] == callback:
-            _LOGGER.debug("Callback is set")
-            return callbacks_list
-        add_callbacks = [callback]
-        for item in callbacks_list:
-            if item["url"] != callback:
-                add_callbacks.append(item["url"])
-            await self.bridge_remove_callback(item["url"])
-        for callback_url in add_callbacks[:3]:
-            result = await self.async_json(
-                lambda r: r.get(self.bridge_url("/callback/add", {"url": callback_url}), timeout=BRIDGE_TIMEOUT)
-            )
-            if not result.get("success", True):
-                raise HomeAssistantError(result.get("message"))
-        _LOGGER.debug("Callback is set - re-added")
+    async def bridge_list_callbacks(self):
         callbacks = await self.async_json(
             lambda r: r.get(self.bridge_url("/callback/list"), timeout=BRIDGE_TIMEOUT)
         )
         return callbacks.get("callbacks", [])
+
+    async def bridge_remove_callback_id(self, callback_id):
+        result = await self.async_json(
+            lambda r: r.get(self.bridge_url("/callback/remove", {"id": callback_id}), timeout=BRIDGE_TIMEOUT)
+        )
+        if not result.get("success", True):
+            raise HomeAssistantError(result.get("message"))
+
+    async def bridge_remove_callback(self, callback: str):
+        removed = False
+        for item in sorted(await self.bridge_list_callbacks(), key=lambda item: item["id"], reverse=True):
+            if item["url"] == callback:
+                await self.bridge_remove_callback_id(item["id"])
+                removed = True
+        return removed
+
+    async def bridge_check_callback(self, callback: str):
+        callbacks_list = await self.bridge_list_callbacks()
+        _LOGGER.debug(f"bridge_check_callback: {callbacks_list}, {callback}")
+        own = [item for item in callbacks_list if item["url"] == callback]
+        if len(own) > 1:
+            for item in sorted(own[1:], key=lambda item: item["id"], reverse=True):
+                _LOGGER.info(f"Removing duplicate callback {item['id']}")
+                await self.bridge_remove_callback_id(item["id"])
+            callbacks_list = await self.bridge_list_callbacks()
+        elif len(own) == 0:
+            if len(callbacks_list) >= 3:
+                raise HomeAssistantError(f"Bridge callback list is full, remove one of {[item['url'] for item in callbacks_list]}")
+            result = await self.async_json(
+                lambda r: r.get(self.bridge_url("/callback/add", {"url": callback}), timeout=BRIDGE_TIMEOUT)
+            )
+            if not result.get("success", True):
+                raise HomeAssistantError(result.get("message"))
+            _LOGGER.info(f"Callback {callback} added")
+            callbacks_list = await self.bridge_list_callbacks()
+        return callbacks_list
 
     def web_url(self, path):
         return f"https://api.nuki.io{path}"
@@ -363,6 +360,9 @@ class NukiCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=config.get("update_seconds", 30)),
         )
 
+        self.callbacks_list = None
+        self._callback_timer = None
+
         hook_id = "%s_%s" % (BRIDGE_HOOK, entry.entry_id)
 
         url = config.get("hass_url", get_url(hass))
@@ -400,7 +400,6 @@ class NukiCoordinator(DataUpdateCoordinator):
 
     async def _update(self):
         try:
-            callbacks_list = None
             bridge_info = None
             info_mapping = dict()
             device_list = None
@@ -414,16 +413,10 @@ class NukiCoordinator(DataUpdateCoordinator):
                     as_hex = f"{deviceType}{as_hex}"
                 return int(as_hex, 16)
             if self.api.can_bridge():
-                try:
-                    callbacks_list = await self.api.bridge_check_callback(
-                        self.bridge_hook
-                    )
-                except Exception:
-                    _LOGGER.exception(f"Failed to update callback {self.bridge_hook}")
                 bridge_info = await self.api.bridge_info()
                 for item in bridge_info.get("scanResults", []):
                     info_mapping[item.get("nukiId")] = item
-                bridge_info["callbacks_list"] = callbacks_list
+                bridge_info["callbacks_list"] = self.callbacks_list
                 device_list = await self.api.bridge_list()
             if self.api.can_web():
                 try:
@@ -471,6 +464,22 @@ class NukiCoordinator(DataUpdateCoordinator):
             _LOGGER.exception(f"Failed to get latest data: {err}")
             raise UpdateFailed from err
 
+    async def async_setup_callback(self):
+        if not self.api.can_bridge():
+            return
+        await self._check_callback(None)
+        self._callback_timer = async_track_time_interval(self.hass, self._check_callback, CALLBACK_CHECK_INTERVAL)
+
+    async def _check_callback(self, _now):
+        try:
+            self.callbacks_list = await self.api.bridge_check_callback(self.bridge_hook)
+        except Exception as err:
+            self.callbacks_list = None
+            _LOGGER.warning(f"Failed to update callback {self.bridge_hook}: {err}")
+        if self.data and self.data.get("bridge_info") is not None:
+            self.data["bridge_info"]["callbacks_list"] = self.callbacks_list
+            self.async_set_updated_data(self.data)
+
     def _make_update_method(self):
         async def _update_data():
             return await self._update()
@@ -486,6 +495,9 @@ class NukiCoordinator(DataUpdateCoordinator):
         return _hook_handler
 
     async def unload(self):
+        if self._callback_timer is not None:
+            self._callback_timer()
+            self._callback_timer = None
         try:
             if self.api.can_bridge():
                 result = await self.api.bridge_remove_callback(self.bridge_hook)
