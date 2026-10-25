@@ -80,6 +80,8 @@ class NukiNGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors = dict(base="no_bridge_url")
         elif user_input.get("token") or user_input.get("web_token"):
             title, err, use_hashed_token = await self.find_nuki_devices(user_input)
+            if not err and not title:
+                err = "no_devices"
             if not err:
                 return self.async_create_entry(
                     title=user_input.get("name") or title,
