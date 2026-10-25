@@ -131,7 +131,7 @@ class NukiEntity(CoordinatorEntity):
 
     @property
     def last_state(self) -> dict:
-        return self.data.get("lastKnownState", {})
+        return self.data.get("lastKnownState") or {}
 
     @property
     def model(self) -> str:

@@ -543,7 +543,7 @@ class NukiCoordinator(DataUpdateCoordinator):
         return self.device_data(dev_id).get("deviceType") in OPENER_DEVICE_TYPES
 
     def device_supports(self, dev_id: str, feature: str) -> bool:
-        return self.device_data(dev_id).get("lastKnownState", {}).get(feature) != None
+        return (self.device_data(dev_id).get("lastKnownState") or {}).get(feature) != None
 
     def info_field(self, dev_id: str, default, *args):
         data = self.device_data(dev_id)

@@ -8,6 +8,10 @@ class BaseStates(Enum):
     def __str__(self):
         return self.name.lower().replace("_", " ").replace("and", "&").title()
 
+    @classmethod
+    def _missing_(cls, value):
+        return cls.default()
+
 
 class LockStates(BaseStates):
     UNCALIBRATED = 0
@@ -21,6 +25,10 @@ class LockStates(BaseStates):
     MOTOR_BLOCKED = 254
     UNDEFINED = 255
 
+    @classmethod
+    def default(cls):
+        return cls.UNDEFINED
+
 
 class DoorSensorStates(BaseStates):
     UNAVAILABLE = 0
@@ -33,13 +41,25 @@ class DoorSensorStates(BaseStates):
     REMOVED = 240
     UNKNOWN = 255
 
+    @classmethod
+    def default(cls):
+        return cls.UNKNOWN
+
 
 class DoorSecurityStates(BaseStates):
     CLOSED_AND_LOCKED = 1
     CLOSED_AND_UNLOCKED = 2
     OPEN = 3
 
+    @classmethod
+    def default(cls):
+        return cls.OPEN
+
 
 class LockModes(BaseStates):
     DOOR_MODE = 2
     CONTINUOUS_MODE = 3
+
+    @classmethod
+    def default(cls):
+        return cls.DOOR_MODE

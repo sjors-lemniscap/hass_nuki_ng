@@ -92,7 +92,7 @@ class RSSI(NukiEntity, SensorEntity):
 
     @property
     def native_value(self):
-        return self.data.get("bridge_info", {}).get("rssi")
+        return (self.data.get("bridge_info") or {}).get("rssi")
 
     @property
     def state(self):
