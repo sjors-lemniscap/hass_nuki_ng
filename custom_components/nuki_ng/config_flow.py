@@ -84,6 +84,8 @@ class NukiNGConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         title, err, use_hashed_token = await self.find_nuki_devices(user_input)
         if err:
             return err, None
+        if not title:
+            return "no_devices", None
         return None, {**user_input, "use_hashed": use_hashed_token, "name": user_input.get("name") or title}
 
     async def async_step_user(self, user_input):
