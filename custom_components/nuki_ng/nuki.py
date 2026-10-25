@@ -38,7 +38,7 @@ class NukiInterface:
         self.bridge = bridge
         self.token = token
         self.web_token = web_token
-        self.use_hashed = False
+        self.use_hashed = use_hashed
 
     async def async_json(self, cb):
         response = await self.hass.async_add_executor_job(lambda: cb(requests))
@@ -72,7 +72,7 @@ class NukiInterface:
             to_hash = "%s,%s,%s" % (tz, rnr, self.token)
             hashed = sha256(to_hash.encode("utf-8")).hexdigest()
             return f"{url}{path}?ts={tz}&rnr={rnr}&hash={hashed}{extra_str}"
-        return f"{url}{path}?token={self.token}{extra_str}"
+        return f"{url}{path}?{urlencode(dict(token=self.token))}{extra_str}"
 
     async def bridge_list(self):
         data = await self.async_json(lambda r: r.get(self.bridge_url("/list"), timeout=BRIDGE_TIMEOUT))
@@ -194,7 +194,12 @@ class NukiInterface:
     def can_bridge(self):
         return True if self.token and self.bridge else False
 
-    async def web_get_last_log(self, dev_id: str):
+    async def web_get_log(self, dev_id: str):
+        return await self.web_async_json(
+            lambda r, h: r.get(self.web_url(f"/smartlock/{dev_id}/log"), headers=h)
+        )
+
+    def web_last_log(self, response, dev_id: str):
         lock_actions_map = {
             1: "unlock",
             2: "lock",
@@ -210,10 +215,6 @@ class NukiInterface:
             6: "activate_continuous_mode",
             7: "deactivate_continuous_mode",
         } for t in OPENER_DEVICE_TYPES})
-        response = await self.web_async_json(
-            lambda r, h: r.get(self.web_url(f"/smartlock/{dev_id}/log"), headers=h)
-        )
-        _LOGGER.debug(f"web_get_last_log ({dev_id}): {response}")
         for item in response:
             actions_map = device_actions_map.get(item.get("deviceType"), {})
             if item.get("action") in actions_map.keys():
@@ -224,16 +225,12 @@ class NukiInterface:
                 }
         return dict()
 
-    async def web_get_last_unlock_log(self, dev_id: str):
+    def web_last_unlock_log(self, response, dev_id: str):
         actions_map = {
             1: "unlock",
             3: "unlatch",
             5: "lock_n_go_unlatch",
         }
-        response = await self.web_async_json(
-            lambda r, h: r.get(self.web_url(f"/smartlock/{dev_id}/log"), headers=h)
-        )
-        _LOGGER.debug(f"web_get_last_unlock_log ({dev_id}): {response}")
         for item in response:
             if item.get("action") in actions_map.keys():
                 # unlock, unlatch, lock'n'go with unlatch
@@ -362,6 +359,7 @@ class NukiCoordinator(DataUpdateCoordinator):
 
         self.callbacks_list = None
         self._callback_timer = None
+        self._web_warned = set()
 
         hook_id = "%s_%s" % (BRIDGE_HOOK, entry.entry_id)
 
@@ -413,17 +411,16 @@ class NukiCoordinator(DataUpdateCoordinator):
                     as_hex = f"{deviceType}{as_hex}"
                 return int(as_hex, 16)
             if self.api.can_bridge():
-                bridge_info = await self.api.bridge_info()
-                for item in bridge_info.get("scanResults", []):
+                bridge_info = await self.api.bridge_info() or {}
+                for item in bridge_info.get("scanResults") or []:
                     info_mapping[item.get("nukiId")] = item
                 bridge_info["callbacks_list"] = self.callbacks_list
                 device_list = await self.api.bridge_list()
             if self.api.can_web():
                 try:
                     web_list = await self.api.web_list()
-                except HomeAssistantError:
-                    _LOGGER.warning("Despite being configured, Web API request has failed")
-                    _LOGGER.exception("Error while fetching list of devices via web API:")
+                except HomeAssistantError as err:
+                    self._web_warning("list", f"Error while fetching list of devices via web API: {err}")
                 if not device_list:
                     device_list = web_list
             result = dict(devices={}, bridge_info=bridge_info)
@@ -437,21 +434,16 @@ class NukiCoordinator(DataUpdateCoordinator):
                     try:
                         item["web_auth"] = await self.api.web_list_all_auths(web_id)
                     except HomeAssistantError as err:
-                        _LOGGER.warning("Despite being configured, Web API request has failed")
-                        _LOGGER.exception(f"Error while fetching auth: {err}")
+                        self._web_warning(f"auth {dev_id}", f"Error while fetching auth: {err}")
                         item["web_auth"] = self.device_data(dev_id).get("web_auth", {})
                     try:
-                        item["last_unlock_log"] = await self.api.web_get_last_unlock_log(web_id)
+                        log = await self.api.web_get_log(web_id)
+                        item["last_log"] = self.api.web_last_log(log, web_id)
+                        item["last_unlock_log"] = self.api.web_last_unlock_log(log, web_id)
                     except HomeAssistantError as err:
-                        _LOGGER.warning("Despite being configured, Web API request has failed")
-                        _LOGGER.exception(f"Error while fetching last unlock log entry: {err}")
-                        item["last_unlock_log"] = self.device_data(dev_id).get("last_unlock_log", {})
-                    try:
-                        item["last_log"] = await self.api.web_get_last_log(web_id)
-                    except HomeAssistantError as err:
-                        _LOGGER.warning("Despite being configured, Web API request has failed")
-                        _LOGGER.exception(f"Error while fetching last log entry: {err}")
+                        self._web_warning(f"log {dev_id}", f"Error while fetching log: {err}")
                         item["last_log"] = self.device_data(dev_id).get("last_log", {})
+                        item["last_unlock_log"] = self.device_data(dev_id).get("last_unlock_log", {})
                 if web_list:
                     item["config"] = web_list.get(web_id, {}).get("config")
                     item["advancedConfig"] = web_list.get(web_id, {}).get("advancedConfig")
@@ -463,6 +455,13 @@ class NukiCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.exception(f"Failed to get latest data: {err}")
             raise UpdateFailed from err
+
+    def _web_warning(self, key: str, message: str):
+        if key in self._web_warned:
+            _LOGGER.debug(message)
+            return
+        self._web_warned.add(key)
+        _LOGGER.warning(f"{message} (further failures are logged at debug level)")
 
     async def async_setup_callback(self):
         if not self.api.can_bridge():
