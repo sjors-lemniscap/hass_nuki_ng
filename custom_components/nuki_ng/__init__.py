@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import service
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -41,43 +43,70 @@ async def async_unload_entry(hass: HomeAssistant, entry):
     return True
 
 
-def _register_coordinator_service(hass: HomeAssistant, name: str, handler):
-    async def handler_(call):
-        for entry_id in await service.async_extract_config_entry_ids(hass, call):
-            if entry := hass.config_entries.async_get_entry(entry_id):
-                if entry.domain == DOMAIN:
-                    _LOGGER.debug(f"service call: {name} for {entry.domain}")
-                    handler(entry.runtime_data, call.data)
+def _service_targets(hass: HomeAssistant, call: ServiceCall):
+    device_reg = dr.async_get(hass)
+    entity_reg = er.async_get(hass)
+    device_ids = set(cv.ensure_list(call.data.get("device_id", [])))
+    for entity_id in cv.ensure_list(call.data.get("entity_id", [])):
+        entity = entity_reg.async_get(entity_id)
+        if entity is not None and entity.device_id:
+            device_ids.add(entity.device_id)
+    targets = []
+    for device_id in device_ids:
+        device = device_reg.async_get(device_id)
+        if device is None:
+            continue
+        for domain, value in device.identifiers:
+            if domain != DOMAIN:
+                continue
+            for entry in hass.config_entries.async_entries(DOMAIN):
+                coordinator = entry.runtime_data
+                if coordinator is None:
+                    continue
+                bridge_id = ((coordinator.data or {}).get("bridge_info") or {}).get("ids", {}).get("hardwareId")
+                if value == bridge_id:
+                    targets.append((coordinator, None))
+                elif value in coordinator.data.get("devices", {}):
+                    targets.append((coordinator, value))
+    return targets
+
+
+def _register_service(hass: HomeAssistant, name: str, handler):
+    async def handler_(call: ServiceCall):
+        targets = _service_targets(hass, call)
+        if not targets:
+            _LOGGER.warning(f"service call {name}: no Nuki device targeted")
+        for coordinator, dev_id in targets:
+            _LOGGER.debug(f"service call: {name} for {dev_id}")
+            await handler(coordinator, dev_id, call.data)
 
     hass.services.async_register(DOMAIN, name, handler_)
 
 
-async def async_setup(hass: HomeAssistant, config) -> bool:
-    _register_coordinator_service(
-        hass,
-        "bridge_reboot",
-        lambda coord, _: hass.async_create_task(coord.do_reboot()),
-    )
-    _register_coordinator_service(
-        hass,
-        "bridge_fwupdate",
-        lambda coord, _: hass.async_create_task(coord.do_fwupdate()),
-    )
-    _register_coordinator_service(
-        hass,
-        "bridge_delete_callback",
-        lambda coord, data: hass.async_create_task(
-            coord.do_delete_callback(data.get("callback"))
-        ),
-    )
-    _register_coordinator_service(
-        hass,
-        "execute_action",
-        lambda coord, data: hass.async_create_task(
-            coord.action_for_devices(data.get("action"))
-        ),
-    )
+async def _bridge_reboot(coordinator, dev_id, data):
+    await coordinator.do_reboot()
 
+
+async def _bridge_fwupdate(coordinator, dev_id, data):
+    await coordinator.do_fwupdate()
+
+
+async def _bridge_delete_callback(coordinator, dev_id, data):
+    await coordinator.do_delete_callback(data.get("callback"))
+
+
+async def _execute_action(coordinator, dev_id, data):
+    if dev_id is None:
+        await coordinator.action_for_devices(data.get("action"))
+    else:
+        await coordinator.action(dev_id, data.get("action"))
+
+
+async def async_setup(hass: HomeAssistant, config) -> bool:
+    _register_service(hass, "bridge_reboot", _bridge_reboot)
+    _register_service(hass, "bridge_fwupdate", _bridge_fwupdate)
+    _register_service(hass, "bridge_delete_callback", _bridge_delete_callback)
+    _register_service(hass, "execute_action", _execute_action)
     return True
 
 
