@@ -289,6 +289,7 @@ class NukiInterface:
         result = dict()
         for item in resp:
             if item.get("type") not in WEB_DEVICE_TYPES:
+                _LOGGER.warning(f"Ignoring {item.get('name')} ({item.get('smartlockId')}) with unsupported device type {item.get('type')}")
                 continue
             state = item.get("state", {})
             result[item.get("smartlockId")] = {
