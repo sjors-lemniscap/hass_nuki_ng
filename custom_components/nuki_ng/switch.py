@@ -4,7 +4,7 @@ from homeassistant.helpers.entity import EntityCategory
 
 import logging
 
-from . import NukiEntity, NukiOpenerRingSuppressionEntity
+from . import NukiEntity, NukiOpenerRingSuppressionEntity, web_device_id
 from .constants import DOMAIN
 from .states import LockModes
 
@@ -90,10 +90,9 @@ class AuthEntry(NukiEntity, SwitchEntity):
     @property
     def device_info(self):
         return {
-            "identifiers": {("web_id", self.device_id)},
+            "identifiers": {(DOMAIN, web_device_id(self.device_id))},
             "name": "Nuki Web API",
             "manufacturer": "Nuki",
-            "via_device": ("id", self.device_id)
         }
 
     @property

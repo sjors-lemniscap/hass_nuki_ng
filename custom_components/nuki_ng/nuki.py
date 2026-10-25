@@ -533,8 +533,18 @@ class NukiCoordinator(DataUpdateCoordinator):
     def web_id(self, dev_id: str):
         return self.device_data(dev_id).get("webId", dev_id)
 
-    def info_data(self):
-        return self.data.get("info", {})
+    def bridge_info(self) -> dict:
+        return (self.data or {}).get("bridge_info") or {}
+
+    def bridge_id(self):
+        return (self.bridge_info().get("ids") or {}).get("hardwareId")
+
+    def model(self, dev_id: str) -> str:
+        if self.is_lock(dev_id):
+            return "Nuki Smart Lock"
+        if self.is_opener(dev_id):
+            return "Nuki Opener"
+        return "Nuki Device"
 
     def is_lock(self, dev_id: str) -> bool:
         return self.device_data(dev_id).get("deviceType") in LOCK_DEVICE_TYPES
